@@ -1,11 +1,11 @@
-"""Pas de HITL-correcties uit output/review.xlsx toe op data/overrides.json.
+"""Pas de HITL-correcties uit output/dbc_drugs.xlsx (tab Controle) toe op data/overrides.json.
 
 Werkwijze:
-1. Draai `main.py` -> schrijft output/review.xlsx (kolom `correctie` met dropdown).
+1. Draai `main.py` -> schrijft output/dbc_drugs.xlsx (tab "Controle", kolom `correctie`).
 2. Vul in de kolom `correctie` het juiste ziektebeeld in waar het voorstel fout is
    (leeg laten = voorstel accepteren).
 3. Draai dit script -> de ingevulde correcties gaan naar data/overrides.json.
-4. Draai `main.py` opnieuw -> de overrides worden toegepast (methode `handmatig`).
+4. Draai `main.py --reuse-verdicts` opnieuw -> de overrides worden toegepast (geen LLM nodig).
 
     ./venv/bin/python -m scripts.apply_review
 """
@@ -17,17 +17,17 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 _ROOT = Path(__file__).resolve().parent.parent
-REVIEW = _ROOT / "output" / "review.xlsx"
+DELIVERABLE = _ROOT / "output" / "dbc_drugs.xlsx"
 OVERRIDES = _ROOT / "data" / "overrides.json"
 
 
 def apply() -> None:
-    if not REVIEW.is_file():
-        raise SystemExit(f"{REVIEW} ontbreekt; draai eerst main.py")
-    wb = load_workbook(REVIEW, read_only=True)
-    ws = wb["review"]
+    if not DELIVERABLE.is_file():
+        raise SystemExit(f"{DELIVERABLE} ontbreekt; draai eerst main.py")
+    wb = load_workbook(DELIVERABLE, read_only=True)
+    ws = wb["Medicatie"]
     kop = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-    i_tekst, i_corr = kop.index("indicatietekst"), kop.index("correctie")
+    i_tekst, i_corr = kop.index("onderbouwing"), kop.index("correctie")
 
     overrides = json.loads(OVERRIDES.read_text(encoding="utf-8")) if OVERRIDES.is_file() else {}
     toegevoegd = 0

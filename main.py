@@ -7,16 +7,20 @@ Stappen:
    lexicon -> embeddings -> lokale LLM). Handmatige overrides gaan voor.
 3. Per ATC7 de ziektebeelden bepalen (add-on primair, Kompas aanvullend) en
    uitbreiden naar DBC-codes (scripts.dbc).
-4. Wegschrijven: drug_dbc.csv (per ATC7), dbc_drugs.xlsx (tab per ziektebeeld),
-   review_queue.csv (HITL, op confidence gesorteerd).
+4. Wegschrijven: drug_dbc.csv (databron per ATC7) en dbc_drugs.xlsx voor de apotheker
+   (tab Controle met geel-gemarkeerde te-checken koppelingen + tab per ziektebeeld).
+   De LLM-verdicts worden gecachet in data/verdicts.json zodat de output (en HITL-
+   correcties) zonder opnieuw te classificeren herbouwd kan worden met --reuse-verdicts.
 
-Draaien: ./venv/bin/python main.py   (opties: --no-llm, --no-embeddings, --limit N)
+Draaien: ./venv/bin/python main.py --model qwen2.5:3b-instruct
+Opties: --no-llm, --no-embeddings, --reuse-verdicts, --limit N
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -29,6 +33,16 @@ from scripts.matching import GEEN, OLLAMA_MODEL, Matcher, Verdict
 _ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = _ROOT / "output"
 OVERRIDES = _ROOT / "data" / "overrides.json"
+VERDICTS_CACHE = _ROOT / "data" / "verdicts.json"
+
+# Methodes waarbij de AI besliste (geel = door de apotheker te controleren); de rest
+# is deterministisch/bevestigd (wit, vertrouwd).
+AI_METHODEN = {"llm", "embedding"}
+
+
+def _categorie(g) -> str:
+    """Vergoedingscategorie van het middel: Add-on (G-standaard BST131) of EVS."""
+    return "Add-on" if g.addon else "EVS"
 
 
 def _atc_groep_ziektebeelden(atc7: str) -> list[str]:
@@ -53,19 +67,32 @@ def _laad_overrides() -> dict[str, str]:
     return {}
 
 
-def _classificeer(universe, ziektebeelden, gebruik_embeddings, gebruik_llm, model) -> dict[str, Verdict]:
+def _classificeer(universe, ziektebeelden, gebruik_embeddings, gebruik_llm, model,
+                  reuse) -> dict[str, Verdict]:
     teksten: list[str] = []
     for g in universe.values():
         teksten += [i["inkort"] for i in g.addon]
         teksten += g.kompas_indicaties
     teksten = list(dict.fromkeys(teksten))
 
-    matcher = Matcher(ziektebeelden, gebruik_embeddings=gebruik_embeddings,
-                      gebruik_llm=gebruik_llm, ollama_model=model)
-    print(f"  matcher: embeddings={'aan' if matcher._embedder else 'uit'} "
-          f"llm={'aan' if matcher.llm else 'uit'} | {len(teksten)} distinct teksten")
-    verdicts = matcher.classify_many(teksten)
+    if reuse and VERDICTS_CACHE.is_file():
+        cache = json.loads(VERDICTS_CACHE.read_text(encoding="utf-8"))
+        verdicts = {t: Verdict(**cache[t]) if t in cache else Verdict(t, GEEN, 0.0, "geen-default")
+                    for t in teksten}
+        ontbreekt = sum(1 for t in teksten if t not in cache)
+        print(f"  verdicts uit cache ({VERDICTS_CACHE.name}); {ontbreekt} niet in cache -> geen")
+    else:
+        matcher = Matcher(ziektebeelden, gebruik_embeddings=gebruik_embeddings,
+                          gebruik_llm=gebruik_llm, ollama_model=model)
+        print(f"  matcher: embeddings={'aan' if matcher._embedder else 'uit'} "
+              f"llm={'aan' if matcher.llm else 'uit'} | {len(teksten)} distinct teksten")
+        verdicts = matcher.classify_many(teksten)
+        VERDICTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        VERDICTS_CACHE.write_text(
+            json.dumps({t: asdict(v) for t, v in verdicts.items()}, ensure_ascii=False, indent=1),
+            encoding="utf-8")
 
+    # Handmatige overrides (HITL) gaan altijd voor, ook bij hergebruik van de cache.
     for tekst, slug in _laad_overrides().items():
         if tekst in verdicts:
             verdicts[tekst] = Verdict(tekst, slug, 1.0, "handmatig")
@@ -119,87 +146,89 @@ def _schrijf_drug_dbc(universe, koppelingen, ziektebeelden):
     return pad
 
 
-def _schrijf_dbc_drugs_xlsx(universe, koppelingen, ziektebeelden):
-    pad = OUTPUT_DIR / "dbc_drugs.xlsx"
+def _schrijf_deliverable_xlsx(universe, koppelingen, ziektebeelden, slugs):
+    """De Excel voor de apotheker: tab Controle + tab per ziektebeeld + Niet gekoppeld.
+
+    - Tab "Controle": alle koppelingen (middel x ziektebeeld). GEEL = door de AI beslist
+      en te controleren; wit = automatisch (lexicon/ATC-groep) of bevestigd. De apotheker
+      kijkt alleen naar de gele rijen en kan corrigeren via de dropdown in `correctie`.
+    - Tab per ziektebeeld: bovenaan de DBC-codes, daaronder de medicatielijst met de
+      vergoedingscategorie (Add-on/EVS); gele rijen zijn AI-beslist.
+    - Tab "Niet gekoppeld": middelen zonder ziektebeeld (controle dat niets gemist is).
+    """
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    GEEL = PatternFill("solid", fgColor="FFF2A8")
+    TEAL = PatternFill("solid", fgColor="0E7C86")
+    KOP = Font(bold=True, color="FFFFFF")
+    VET = Font(bold=True)
+
+    def _kleur_kop(ws, rij=1):
+        for c in ws[rij]:
+            c.font, c.fill = KOP, TEAL
+
+    def _geel(ws):
+        for c in ws[ws.max_row]:
+            c.fill = GEEL
+
     wb = Workbook()
-    samenvatting = wb.active
-    samenvatting.title = "samenvatting"
-    samenvatting.append(["ziektebeeld", "aantal_dbc_codes", "aantal_geneesmiddelen"])
 
+    # --- Tab 1: Medicatie (overzicht + controle) ---
+    ws = wb.active
+    ws.title = "Medicatie"
+    kop = ["ziektebeeld", "atc7", "stofnaam", "categorie", "zekerheid", "methode",
+           "onderbouwing", "correctie"]
+    ws.append(kop)
+    rijen = []
+    for atc7, kopp in koppelingen.items():
+        g = universe[atc7]
+        for zb, info in kopp.items():
+            rijen.append((info["methode"] in AI_METHODEN, zb, atc7, g.stofnaam,
+                          _categorie(g), info))
+    rijen.sort(key=lambda r: (not r[0], r[1], r[3]))  # te-checken (geel) eerst
+    for is_ai, zb, atc7, stof, cat, info in rijen:
+        ws.append([zb, atc7, stof, cat, round(info["confidence"], 2), info["methode"],
+                   info["tekst"], ""])
+        if is_ai:
+            _geel(ws)
+    _kleur_kop(ws)
+    keuzes = ",".join(list(slugs) + ["geen"])
+    dv = DataValidation(type="list", formula1=f'"{keuzes}"', allow_blank=True,
+                        showInputMessage=True, promptTitle="Correctie",
+                        prompt="Kies een ziektebeeld of 'geen'. Leeg laten = voorstel akkoord.")
+    ws.add_data_validation(dv)
+    dv.add(f"H2:H{ws.max_row}")
+    for col, br in {"A": 20, "B": 10, "C": 26, "D": 10, "E": 10, "F": 12, "G": 60, "H": 20}.items():
+        ws.column_dimensions[col].width = br
+    ws.freeze_panes = "A2"
+
+    # --- Tab per ziektebeeld ---
     for slug, z in ziektebeelden.items():
-        meds = sorted(atc7 for atc7, kopp in koppelingen.items() if slug in kopp)
-        samenvatting.append([slug, len(z.dbc_codes), len(meds)])
-
         ws = wb.create_sheet(title=slug[:31])
         ws.append(["DBC-codes"])
+        ws[ws.max_row][0].font = VET
         ws.append(["specialisme_code", "diagnose_code", "omschrijving"])
+        _kleur_kop(ws, ws.max_row)
         for c in z.dbc_codes:
             ws.append([c.specialisme_code, c.diagnose_code, c.omschrijving])
         ws.append([])
         ws.append(["Geneesmiddelen"])
-        ws.append(["atc7", "stofnaam", "bron", "indicatie_aard", "confidence", "methode"])
+        ws[ws.max_row][0].font = VET
+        ws.append(["atc7", "stofnaam", "categorie", "zekerheid", "methode"])
+        _kleur_kop(ws, ws.max_row)
+        meds = sorted((a for a, k in koppelingen.items() if slug in k),
+                      key=lambda a: (koppelingen[a][slug]["methode"] not in AI_METHODEN, a))
         for atc7 in meds:
             info = koppelingen[atc7][slug]
-            ws.append([atc7, universe[atc7].stofnaam, info["bron"], info["indicatie_aard"],
+            ws.append([atc7, universe[atc7].stofnaam, _categorie(universe[atc7]),
                        round(info["confidence"], 2), info["methode"]])
-    wb.save(pad)
-    return pad
+            if info["methode"] in AI_METHODEN:
+                _geel(ws)
+        for col, br in {"A": 10, "B": 26, "C": 10, "D": 10, "E": 12}.items():
+            ws.column_dimensions[col].width = br
 
-
-def _schrijf_review_xlsx(universe, verdicts, slugs):
-    """HITL-werklijst: een rij per indicatietekst met een dropdown-correctiekolom.
-
-    Leeg laten = het voorstel accepteren. Een correctie invullen (uit de dropdown)
-    en daarna `python -m scripts.apply_review` draaien zet 'm in data/overrides.json.
-    Gesorteerd op confidence oplopend (onzeker bovenaan); lexicon-treffers onderaan.
-    """
-    from openpyxl.worksheet.datavalidation import DataValidation
-
-    voorbeeld: dict[str, tuple[str, str, str]] = {}  # tekst -> (bron, atc7, stofnaam)
-    for atc7, g in universe.items():
-        for ind in g.addon:
-            voorbeeld.setdefault(ind["inkort"], ("add-on", atc7, g.stofnaam))
-        for b in g.kompas_indicaties:
-            voorbeeld.setdefault(b, ("kompas", atc7, g.stofnaam))
-
-    rijen = sorted(verdicts.values(), key=lambda v: (v.methode == "lexicon", v.score))
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "review"
-    kop = ["indicatietekst", "voorstel", "correctie", "confidence", "methode",
-           "rationale", "bron", "voorbeeld_atc7", "voorbeeld_stofnaam"]
-    ws.append(kop)
-    for v in rijen:
-        bron, atc7, stof = voorbeeld.get(v.tekst, ("", "", ""))
-        ws.append([v.tekst, v.ziektebeeld, "", round(v.score, 2), v.methode,
-                   v.rationale, bron, atc7, stof])
-
-    from openpyxl.styles import Font, PatternFill
-
-    # Dropdown met de 14 ziektebeelden + "geen" op de correctie-kolom, met hint-popup.
-    keuzes = ",".join(list(slugs) + ["geen"])
-    dv = DataValidation(type="list", formula1=f'"{keuzes}"', allow_blank=True,
-                        showDropDown=False, showInputMessage=True,
-                        promptTitle="Correctie",
-                        prompt="Kies een ziektebeeld of 'geen'. Leeg laten = voorstel akkoord.")
-    ws.add_data_validation(dv)
-    dv.add(f"C2:C{ws.max_row}")
-
-    # Opmaak zodat de apotheker direct ziet waar te corrigeren.
-    kopfill = PatternFill("solid", fgColor="0E7C86")
-    for ci in range(1, len(kop) + 1):
-        c = ws.cell(1, ci)
-        c.font = Font(bold=True, color="FFFFFF")
-        c.fill = kopfill
-    corrfill = PatternFill("solid", fgColor="FBE7DA")
-    for r in range(2, ws.max_row + 1):
-        ws.cell(r, 3).fill = corrfill
-    for col, breedte in {"A": 70, "B": 20, "C": 20, "D": 11, "E": 12,
-                         "F": 50, "G": 9, "H": 13, "I": 22}.items():
-        ws.column_dimensions[col].width = breedte
-    ws.freeze_panes = "A2"
-
-    pad = OUTPUT_DIR / "review.xlsx"
+    pad = OUTPUT_DIR / "dbc_drugs.xlsx"
     wb.save(pad)
     return pad
 
@@ -209,6 +238,8 @@ def main():
     ap.add_argument("--no-embeddings", action="store_true")
     ap.add_argument("--no-llm", action="store_true")
     ap.add_argument("--model", default=OLLAMA_MODEL, help="Ollama-model voor de LLM-laag")
+    ap.add_argument("--reuse-verdicts", action="store_true",
+                    help="laad de classificatie uit data/verdicts.json (geen LLM); alleen output herbouwen")
     ap.add_argument("--limit", type=int, default=0, help="beperk universum (test)")
     args = ap.parse_args()
 
@@ -233,7 +264,7 @@ def main():
     print("Indicaties classificeren...")
     verdicts = _classificeer(via_engine, ziektebeelden,
                              gebruik_embeddings=not args.no_embeddings, gebruik_llm=not args.no_llm,
-                             model=args.model)
+                             model=args.model, reuse=args.reuse_verdicts)
 
     koppelingen: dict[str, dict] = {}
     for atc7, g in universe.items():
@@ -249,8 +280,7 @@ def main():
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     p1 = _schrijf_drug_dbc(universe, koppelingen, ziektebeelden)
-    p2 = _schrijf_dbc_drugs_xlsx(universe, koppelingen, ziektebeelden)
-    p3 = _schrijf_review_xlsx(universe, verdicts, list(ziektebeelden))
+    p2 = _schrijf_deliverable_xlsx(universe, koppelingen, ziektebeelden, list(ziektebeelden))
 
     import collections
     methodes = collections.Counter(v.methode for v in verdicts.values())
@@ -259,7 +289,7 @@ def main():
     print(f"Klaar. {gekoppeld}/{len(universe)} ATC7 gekoppeld aan >=1 ziektebeeld.")
     print(f"  verdicts per methode: {dict(methodes)}")
     print(f"  geneesmiddelen per ziektebeeld: {dict(per_zb.most_common())}")
-    for p in (p1, p2, p3):
+    for p in (p1, p2):
         print(f"  -> {p}")
 
 
