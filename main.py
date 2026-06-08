@@ -31,6 +31,21 @@ OUTPUT_DIR = _ROOT / "output"
 OVERRIDES = _ROOT / "data" / "overrides.json"
 
 
+def _atc_groep_ziektebeelden(atc7: str) -> list[str]:
+    """Directe ATC-groep-regel voor diabetes/obesitas (geen tekst-matching nodig).
+
+    De ATC-groep is hier zelf de diagnose, exact volgens de ATC-indeling: A10 =
+    geneesmiddelen bij diabetes (inclusief de GLP-1's in A10BJ), A08 = antiobesitas.
+    Oncologie (L) valt hier bewust buiten: die ATC-groep zegt niets over de tumor,
+    dus die loopt door de matching-engine.
+    """
+    if atc7.startswith("A08"):
+        return ["obesitas"]
+    if atc7.startswith("A10"):
+        return ["diabetes"]
+    return []
+
+
 def _laad_overrides() -> dict[str, str]:
     """Handmatige beslissingen tekst(lowercase) -> ziektebeeld-slug (HITL)."""
     if OVERRIDES.is_file():
@@ -159,12 +174,29 @@ def main():
     print(f"  {len(universe)} ATC7 in scope")
 
     ziektebeelden = load_ziektebeelden()
+
+    # Diabetes/obesitas (A10/A08) direct per ATC-groep; alleen oncologie (L) via de engine.
+    direct = {a: g for a, g in universe.items() if _atc_groep_ziektebeelden(a)}
+    via_engine = {a: g for a, g in universe.items() if not _atc_groep_ziektebeelden(a)}
+    print(f"  {len(direct)} ATC7 direct via ATC-groep (diabetes/obesitas), "
+          f"{len(via_engine)} via de matching-engine (oncologie)")
+
     print("Indicaties classificeren...")
-    verdicts = _classificeer(universe, ziektebeelden,
+    verdicts = _classificeer(via_engine, ziektebeelden,
                              gebruik_embeddings=not args.no_embeddings, gebruik_llm=not args.no_llm,
                              model=args.model)
 
-    koppelingen = {atc7: _ziektebeelden_per_atc(g, verdicts) for atc7, g in universe.items()}
+    koppelingen: dict[str, dict] = {}
+    for atc7, g in universe.items():
+        groep = _atc_groep_ziektebeelden(atc7)
+        if groep:
+            koppelingen[atc7] = {
+                zb: {"bron": "atc-groep", "indicatie_aard": "", "confidence": 1.0,
+                     "methode": "atc-groep", "tekst": ""}
+                for zb in groep
+            }
+        else:
+            koppelingen[atc7] = _ziektebeelden_per_atc(g, verdicts)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     p1 = _schrijf_drug_dbc(universe, koppelingen, ziektebeelden)
