@@ -73,18 +73,30 @@ def _classificeer(universe, ziektebeelden, gebruik_embeddings, gebruik_llm, mode
 
 
 def _ziektebeelden_per_atc(g, verdicts) -> dict[str, dict]:
-    """Per ATC7: ziektebeeld -> koppelinfo (add-on primair, Kompas aanvullend)."""
+    """Per ATC7: ziektebeeld -> koppelinfo (add-on primair, Kompas aanvullend).
+
+    Bij meerdere indicaties op hetzelfde ziektebeeld wordt de indicatie met de
+    hoogste confidence als herkomst bewaard (de koppeling zelf verandert daar niet van).
+    """
     gekoppeld: dict[str, dict] = {}
+    addon_zbs: set[str] = set()
     for ind in g.addon:  # add-on eerst (autoritair)
         v = verdicts[ind["inkort"]]
-        if v.ziektebeeld != GEEN and v.ziektebeeld not in gekoppeld:
+        if v.ziektebeeld == GEEN:
+            continue
+        addon_zbs.add(v.ziektebeeld)
+        best = gekoppeld.get(v.ziektebeeld)
+        if best is None or v.score > best["confidence"]:
             gekoppeld[v.ziektebeeld] = {
                 "bron": "add-on", "indicatie_aard": ind["indicatie_aard"],
                 "confidence": v.score, "methode": v.methode, "tekst": ind["inkort"],
             }
-    for bullet in g.kompas_indicaties:  # Kompas vult aan
+    for bullet in g.kompas_indicaties:  # Kompas vult ziektebeelden aan die add-on niet leverde
         v = verdicts[bullet]
-        if v.ziektebeeld != GEEN and v.ziektebeeld not in gekoppeld:
+        if v.ziektebeeld == GEEN or v.ziektebeeld in addon_zbs:
+            continue
+        best = gekoppeld.get(v.ziektebeeld)
+        if best is None or v.score > best["confidence"]:
             gekoppeld[v.ziektebeeld] = {
                 "bron": "kompas", "indicatie_aard": "",
                 "confidence": v.score, "methode": v.methode, "tekst": bullet,
@@ -134,8 +146,15 @@ def _schrijf_dbc_drugs_xlsx(universe, koppelingen, ziektebeelden):
     return pad
 
 
-def _schrijf_review_queue(universe, verdicts):
-    """Niet-lexicon-verdicts voor de HITL, op confidence oplopend (onzeker eerst)."""
+def _schrijf_review_xlsx(universe, verdicts, slugs):
+    """HITL-werklijst: een rij per indicatietekst met een dropdown-correctiekolom.
+
+    Leeg laten = het voorstel accepteren. Een correctie invullen (uit de dropdown)
+    en daarna `python -m scripts.apply_review` draaien zet 'm in data/overrides.json.
+    Gesorteerd op confidence oplopend (onzeker bovenaan); lexicon-treffers onderaan.
+    """
+    from openpyxl.worksheet.datavalidation import DataValidation
+
     voorbeeld: dict[str, tuple[str, str, str]] = {}  # tekst -> (bron, atc7, stofnaam)
     for atc7, g in universe.items():
         for ind in g.addon:
@@ -143,15 +162,45 @@ def _schrijf_review_queue(universe, verdicts):
         for b in g.kompas_indicaties:
             voorbeeld.setdefault(b, ("kompas", atc7, g.stofnaam))
 
-    rijen = sorted((v for v in verdicts.values() if v.methode != "lexicon"), key=lambda v: v.score)
-    pad = OUTPUT_DIR / "review_queue.csv"
-    with open(pad, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["confidence", "methode", "voorgesteld_ziektebeeld", "indicatietekst",
-                    "bron", "voorbeeld_atc7", "voorbeeld_stofnaam", "rationale"])
-        for v in rijen:
-            bron, atc7, stof = voorbeeld.get(v.tekst, ("", "", ""))
-            w.writerow([f"{v.score:.2f}", v.methode, v.ziektebeeld, v.tekst, bron, atc7, stof, v.rationale])
+    rijen = sorted(verdicts.values(), key=lambda v: (v.methode == "lexicon", v.score))
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "review"
+    kop = ["indicatietekst", "voorstel", "correctie", "confidence", "methode",
+           "rationale", "bron", "voorbeeld_atc7", "voorbeeld_stofnaam"]
+    ws.append(kop)
+    for v in rijen:
+        bron, atc7, stof = voorbeeld.get(v.tekst, ("", "", ""))
+        ws.append([v.tekst, v.ziektebeeld, "", round(v.score, 2), v.methode,
+                   v.rationale, bron, atc7, stof])
+
+    from openpyxl.styles import Font, PatternFill
+
+    # Dropdown met de 14 ziektebeelden + "geen" op de correctie-kolom, met hint-popup.
+    keuzes = ",".join(list(slugs) + ["geen"])
+    dv = DataValidation(type="list", formula1=f'"{keuzes}"', allow_blank=True,
+                        showDropDown=False, showInputMessage=True,
+                        promptTitle="Correctie",
+                        prompt="Kies een ziektebeeld of 'geen'. Leeg laten = voorstel akkoord.")
+    ws.add_data_validation(dv)
+    dv.add(f"C2:C{ws.max_row}")
+
+    # Opmaak zodat de apotheker direct ziet waar te corrigeren.
+    kopfill = PatternFill("solid", fgColor="0E7C86")
+    for ci in range(1, len(kop) + 1):
+        c = ws.cell(1, ci)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = kopfill
+    corrfill = PatternFill("solid", fgColor="FBE7DA")
+    for r in range(2, ws.max_row + 1):
+        ws.cell(r, 3).fill = corrfill
+    for col, breedte in {"A": 70, "B": 20, "C": 20, "D": 11, "E": 12,
+                         "F": 50, "G": 9, "H": 13, "I": 22}.items():
+        ws.column_dimensions[col].width = breedte
+    ws.freeze_panes = "A2"
+
+    pad = OUTPUT_DIR / "review.xlsx"
+    wb.save(pad)
     return pad
 
 
@@ -201,7 +250,7 @@ def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
     p1 = _schrijf_drug_dbc(universe, koppelingen, ziektebeelden)
     p2 = _schrijf_dbc_drugs_xlsx(universe, koppelingen, ziektebeelden)
-    p3 = _schrijf_review_queue(universe, verdicts)
+    p3 = _schrijf_review_xlsx(universe, verdicts, list(ziektebeelden))
 
     import collections
     methodes = collections.Counter(v.methode for v in verdicts.values())
