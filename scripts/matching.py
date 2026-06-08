@@ -20,8 +20,13 @@ from scripts import mapping
 
 GEEN = "geen"
 EMBED_MODEL = "BAAI/bge-m3"
+# 7B is nauwkeuriger maar past krap in 6 GB VRAM. Past het niet (controleer met
+# `ollama ps`: hoog CPU% = traag), gebruik dan "qwen2.5:3b-instruct" - die draait
+# volledig op de GPU en is fors sneller, met voor deze afgebakende taak nauwelijks
+# kwaliteitsverlies.
 OLLAMA_MODEL = "qwen2.5:7b-instruct"
 OLLAMA_URL = "http://localhost:11434/api/generate"
+NUM_CTX = 2048   # korte prompts; kleine KV-cache zodat het model in 6 GB VRAM past
 TOP_K = 4
 EMBED_DREMPEL = 0.55  # fallback-drempel als de LLM niet beschikbaar is
 
@@ -70,7 +75,7 @@ def _vraag_llm(tekst: str, kandidaten: list[tuple[str, str]], model: str) -> dic
     resp = requests.post(
         OLLAMA_URL,
         json={"model": model, "prompt": prompt, "stream": False, "format": "json",
-              "options": {"temperature": 0}},
+              "options": {"temperature": 0, "num_ctx": NUM_CTX}},
         timeout=120,
     )
     resp.raise_for_status()
@@ -81,7 +86,13 @@ class Matcher:
     def __init__(self, ziektebeelden: dict, gebruik_embeddings: bool = True,
                  gebruik_llm: bool = True, ollama_model: str = OLLAMA_MODEL):
         self.slugs = list(ziektebeelden)
+        # Volledig profiel (incl. ICD) voor de embeddings; kort profiel (naam + DBC-
+        # omschrijvingen) voor de LLM-prompt, zodat die compact blijft en in NUM_CTX past.
         self.profielen = {s: z.referentieprofiel() for s, z in ziektebeelden.items()}
+        self.kort = {
+            s: (z.naam + ": " + "; ".join(dict.fromkeys(c.omschrijving for c in z.dbc_codes)))[:300]
+            for s, z in ziektebeelden.items()
+        }
         self.ollama_model = ollama_model
         self._embedder = _Embedder() if gebruik_embeddings else None
         self._profiel_emb = (
@@ -105,11 +116,14 @@ class Matcher:
     def _beslis(self, tekst: str, kand: list[tuple[str, float]]) -> Verdict:
         """LLM-oordeel als beschikbaar, anders cosine-drempel."""
         if self.llm:
-            antwoord = _vraag_llm(tekst, [(s, self.profielen[s]) for s, _ in kand], self.ollama_model)
-            zb = antwoord.get("ziektebeeld", GEEN)
-            zb = zb if zb in self.slugs else GEEN
-            return Verdict(tekst, zb, float(antwoord.get("confidence", 0.0)), "llm",
-                           str(antwoord.get("rationale", "")))
+            try:
+                antwoord = _vraag_llm(tekst, [(s, self.kort[s]) for s, _ in kand], self.ollama_model)
+                zb = antwoord.get("ziektebeeld", GEEN)
+                zb = zb if zb in self.slugs else GEEN
+                return Verdict(tekst, zb, float(antwoord.get("confidence", 0.0)), "llm",
+                               str(antwoord.get("rationale", "")))
+            except Exception:
+                pass  # een kapotte/trage LLM-respons mag de run niet stoppen: val terug
         top_slug, top_score = kand[0]
         return (Verdict(tekst, top_slug, top_score, "embedding")
                 if top_score >= EMBED_DREMPEL else Verdict(tekst, GEEN, top_score, "geen-default"))
@@ -130,6 +144,8 @@ class Matcher:
                 resultaat[t] = Verdict(t, GEEN, 0.0, "geen-default")
         if deferred:
             kand = self._kandidaten_batch(deferred)
-            for t in deferred:
+            for i, t in enumerate(deferred, 1):
                 resultaat[t] = self._beslis(t, kand[t])
+                if self.llm and (i % 50 == 0 or i == len(deferred)):
+                    print(f"    LLM {i}/{len(deferred)}", flush=True)
         return resultaat

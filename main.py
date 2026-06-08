@@ -24,7 +24,7 @@ from openpyxl import Workbook
 from scripts import drugs
 from scripts.dbc import load_ziektebeelden
 from scripts.gstandaard import DEFAULT_DB_PATH, GstandaardDB
-from scripts.matching import GEEN, Matcher, Verdict
+from scripts.matching import GEEN, OLLAMA_MODEL, Matcher, Verdict
 
 _ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = _ROOT / "output"
@@ -38,14 +38,15 @@ def _laad_overrides() -> dict[str, str]:
     return {}
 
 
-def _classificeer(universe, ziektebeelden, gebruik_embeddings, gebruik_llm) -> dict[str, Verdict]:
+def _classificeer(universe, ziektebeelden, gebruik_embeddings, gebruik_llm, model) -> dict[str, Verdict]:
     teksten: list[str] = []
     for g in universe.values():
         teksten += [i["inkort"] for i in g.addon]
         teksten += g.kompas_indicaties
     teksten = list(dict.fromkeys(teksten))
 
-    matcher = Matcher(ziektebeelden, gebruik_embeddings=gebruik_embeddings, gebruik_llm=gebruik_llm)
+    matcher = Matcher(ziektebeelden, gebruik_embeddings=gebruik_embeddings,
+                      gebruik_llm=gebruik_llm, ollama_model=model)
     print(f"  matcher: embeddings={'aan' if matcher._embedder else 'uit'} "
           f"llm={'aan' if matcher.llm else 'uit'} | {len(teksten)} distinct teksten")
     verdicts = matcher.classify_many(teksten)
@@ -143,6 +144,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-embeddings", action="store_true")
     ap.add_argument("--no-llm", action="store_true")
+    ap.add_argument("--model", default=OLLAMA_MODEL, help="Ollama-model voor de LLM-laag")
     ap.add_argument("--limit", type=int, default=0, help="beperk universum (test)")
     args = ap.parse_args()
 
@@ -159,7 +161,8 @@ def main():
     ziektebeelden = load_ziektebeelden()
     print("Indicaties classificeren...")
     verdicts = _classificeer(universe, ziektebeelden,
-                             gebruik_embeddings=not args.no_embeddings, gebruik_llm=not args.no_llm)
+                             gebruik_embeddings=not args.no_embeddings, gebruik_llm=not args.no_llm,
+                             model=args.model)
 
     koppelingen = {atc7: _ziektebeelden_per_atc(g, verdicts) for atc7, g in universe.items()}
 
@@ -167,8 +170,14 @@ def main():
     p1 = _schrijf_drug_dbc(universe, koppelingen, ziektebeelden)
     p2 = _schrijf_dbc_drugs_xlsx(universe, koppelingen, ziektebeelden)
     p3 = _schrijf_review_queue(universe, verdicts)
+
+    import collections
+    methodes = collections.Counter(v.methode for v in verdicts.values())
+    per_zb = collections.Counter(slug for k in koppelingen.values() for slug in k)
     gekoppeld = sum(1 for k in koppelingen.values() if k)
     print(f"Klaar. {gekoppeld}/{len(universe)} ATC7 gekoppeld aan >=1 ziektebeeld.")
+    print(f"  verdicts per methode: {dict(methodes)}")
+    print(f"  geneesmiddelen per ziektebeeld: {dict(per_zb.most_common())}")
     for p in (p1, p2, p3):
         print(f"  -> {p}")
 
