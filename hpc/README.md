@@ -1,9 +1,9 @@
 # De LLM-classificatie op de Leiden HPC (ALICE) draaien
 
 De zware stap (de LLM) draait los van de rest. Lokaal bouw je een kleine **worklist**,
-op ALICE classificeer je die met een groter model (Qwen2.5-14B op 1x RTX 2080 Ti), en
-lokaal bouw je daarna de Excel. ALICE heeft geen embeddings/Kompas/S3 nodig - alleen
-`worklist.json` en Ollama.
+op ALICE classificeer je die met **vLLM + een HuggingFace-model** (Qwen2.5-14B-Instruct-AWQ
+op 1x RTX 2080 Ti), en lokaal bouw je daarna de Excel. ALICE heeft geen embeddings/Kompas/S3
+nodig - alleen `worklist.json`, vLLM en het HF-model (HuggingFace is bereikbaar op ALICE).
 
 ```
 lokaal:  export_worklist  ->  data/worklist.json
@@ -44,27 +44,24 @@ rsync -avz data/worklist.json "$DEST/data/"
 `scripts/`, `main.py`, `hpc/` en `data/worklist.json` zijn genoeg; de G-standaard, de
 Kompas-cache en de embeddings hoeven NIET mee.
 
-## 3. Eenmalige setup op de login-node (heeft internet)
+## 3. De GPU-job submitten
+
+De job draait alles op de compute-node (heeft internet): hij maakt een venv met vLLM
+(`venv-vllm/`), downloadt het HF-model naar `.hf_cache/` (op /zfsstore of /data1) en
+classificeert. Niets op de login-node.
 
 ```bash
 cd /data1/<gebruiker>/ATC-IKNL
-bash hpc/setup_login.sh          # installeert Ollama user-local + pullt qwen2.5:14b-instruct
-```
-
-(De compute-nodes hebben vaak geen internet; daarom pullen we het model hier.)
-
-## 4. De GPU-job submitten
-
-```bash
 sbatch hpc/classify.sh           # 1x 2080 Ti, max 8 uur, resumebaar
 squeue --me                      # status
-tail -f logs/<jobid>.out         # voortgang (LLM x/y)
+tail -f logs/<jobid>.out         # voortgang (vLLM x/y) + "Device: cuda"
 ```
 
-Valt de job uit of loopt de walltime af, submit dan gewoon opnieuw: `verdicts.json` wordt
-incrementeel weggeschreven, dus een herstart pakt alleen de resterende teksten op.
+Valt de job uit of loopt de walltime af, submit dan gewoon opnieuw: zowel het model
+(`.hf_cache/`) als `verdicts.json` worden gecachet, dus een herstart pakt alleen de
+resterende teksten op.
 
-## 5. Resultaat terughalen en lokaal de Excel bouwen
+## 4. Resultaat terughalen en lokaal de Excel bouwen
 
 ```bash
 # op je laptop:
@@ -76,7 +73,11 @@ rsync -avz <ulcn-gebruiker>@login1.alice.universiteitleiden.nl:/data1/<gebruiker
 `output/dbc_drugs.xlsx` is dan klaar voor de apotheker.
 
 ## Aandachtspunten
-- Past het model niet (`logs/ollama_*.log` toont CPU-fallback), kies dan een kleiner
-  model: `MODEL=qwen2.5:7b-instruct sbatch hpc/classify.sh`.
-- Quota: `/data1` heeft meer ruimte dan je home; zet het project en `ollama/models` daar.
+- Past de 14B niet in 11 GB of werkt de AWQ-kernel niet op de 2080 Ti, kies een kleiner
+  of ander gequantiseerd model: `MODEL=Qwen/Qwen2.5-7B-Instruct-AWQ sbatch hpc/classify.sh`
+  (of een GPTQ-variant). De prompts zijn kort, dus `max_model_len=2048` volstaat.
+- Quota: zet het project en `.hf_cache/` + `venv-vllm/` op `/data1` of `/zfsstore`, niet je home.
 - Node-excludes `node860,node857` staan al in de job (bekende kapotte CUDA-nodes).
+- **Getest:** de classificatielogica (export -> classify -> verdicts -> Excel) is lokaal
+  end-to-end gevalideerd; de vLLM-op-ALICE-stap (module-namen, vLLM-install, AWQ op de
+  2080 Ti) is gebaseerd op de ALICE-docs en kan een kleine aanpassing nodig hebben.

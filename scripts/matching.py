@@ -14,6 +14,7 @@ de ontbrekende teksten en schrijft incrementeel weg - zo is een lange run resume
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -63,14 +64,14 @@ def _ollama_beschikbaar() -> bool:
         return False
 
 
-def _vraag_llm(tekst: str, kandidaten: list[tuple[str, str]], hint: str, model: str) -> dict:
-    """Laat de LLM kiezen uit de kandidaat-ziektebeelden of 'geen'. Retour: dict-JSON."""
+def bouw_prompt(tekst: str, kandidaten: list[tuple[str, str]], hint: str) -> str:
+    """De classificatieprompt (gedeeld door de Ollama- en vLLM-backend)."""
     opties = "\n".join(f"- {slug}: {profiel}" for slug, profiel in kandidaten)
     hint_regel = (
         f"Een trefwoordsysteem suggereert: {hint}. Controleer dit; het kan fout zijn "
         f"(bv. door een uitgesloten woord of een verkeerde tumor).\n\n" if hint else ""
     )
-    prompt = (
+    return (
         "Je classificeert een Nederlandse geneesmiddel-indicatie naar precies een "
         "DBC-ziektebeeld, of naar 'geen' als de indicatie niet bij een van de opties hoort "
         "(bv. hematologische kanker, auto-immuunziekte, of een tumor die niet in de lijst staat).\n\n"
@@ -80,14 +81,42 @@ def _vraag_llm(tekst: str, kandidaten: list[tuple[str, str]], hint: str, model: 
         "Antwoord uitsluitend met JSON: "
         '{"ziektebeeld": "<slug of geen>", "confidence": <0..1>, "rationale": "<een zin>"}'
     )
+
+
+def parse_antwoord(tekst: str) -> dict:
+    """Parse het JSON-antwoord van de LLM; tolerant voor wat tekst eromheen."""
+    try:
+        return json.loads(tekst)
+    except Exception:
+        m = re.search(r"\{.*\}", tekst, re.S)
+        try:
+            return json.loads(m.group(0)) if m else {}
+        except Exception:
+            return {}
+
+
+def verdict_uit_antwoord(tekst: str, antwoord: dict, slugs, hint: str) -> Verdict:
+    """Bouw een Verdict uit een (geparsed) LLM-antwoord; flag bij afwijking van het lexicon."""
+    zb = antwoord.get("ziektebeeld", GEEN)
+    zb = zb if zb in slugs else GEEN
+    try:
+        conf = float(antwoord.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return Verdict(tekst, zb, conf, "llm", str(antwoord.get("rationale", "")),
+                   lexicon=hint, flag=bool(hint and hint != zb))
+
+
+def _vraag_llm(tekst: str, kandidaten: list[tuple[str, str]], hint: str, model: str) -> dict:
+    """Vraag de Ollama-LLM (1 tekst). Retour: dict-JSON."""
     resp = requests.post(
         OLLAMA_URL,
-        json={"model": model, "prompt": prompt, "stream": False, "format": "json",
-              "options": {"temperature": 0, "num_ctx": NUM_CTX}},
+        json={"model": model, "prompt": bouw_prompt(tekst, kandidaten, hint), "stream": False,
+              "format": "json", "options": {"temperature": 0, "num_ctx": NUM_CTX}},
         timeout=120,
     )
     resp.raise_for_status()
-    return json.loads(resp.json()["response"])
+    return parse_antwoord(resp.json()["response"])
 
 
 def _laad_checkpoint(pad) -> dict[str, Verdict]:
@@ -146,10 +175,7 @@ class Matcher:
         hint = mapping.map_text(tekst) or ""
         try:
             antwoord = _vraag_llm(tekst, [(s, self.kort[s]) for s, _ in kand], hint, self.ollama_model)
-            zb = antwoord.get("ziektebeeld", GEEN)
-            zb = zb if zb in self.slugs else GEEN
-            return Verdict(tekst, zb, float(antwoord.get("confidence", 0.0)), "llm",
-                           str(antwoord.get("rationale", "")), lexicon=hint, flag=bool(hint and hint != zb))
+            return verdict_uit_antwoord(tekst, antwoord, self.slugs, hint)
         except Exception:
             if hint:
                 return Verdict(tekst, hint, 1.0, "lexicon", lexicon=hint)
