@@ -128,6 +128,18 @@ class Matcher:
         return (Verdict(tekst, top_slug, top_score, "embedding")
                 if top_score >= EMBED_DREMPEL else Verdict(tekst, GEEN, top_score, "geen-default"))
 
+    def _vrijgeven_embedder(self) -> None:
+        """Geef het GPU-geheugen van de embedder vrij (na de batch, voor de LLM-loop)."""
+        self._embedder = None
+        try:
+            import gc
+
+            import torch
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def classify(self, tekst: str) -> Verdict:
         return self.classify_many([tekst])[tekst]
 
@@ -144,6 +156,8 @@ class Matcher:
                 resultaat[t] = Verdict(t, GEEN, 0.0, "geen-default")
         if deferred:
             kand = self._kandidaten_batch(deferred)
+            if self.llm:
+                self._vrijgeven_embedder()  # GPU vrij voor de LLM-pass (sequentieel)
             for i, t in enumerate(deferred, 1):
                 resultaat[t] = self._beslis(t, kand[t])
                 if self.llm and (i % 50 == 0 or i == len(deferred)):
