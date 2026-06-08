@@ -19,15 +19,16 @@ from scripts.gstandaard import (
 
 _BATCH = 5000
 
-# tabel -> (kolommen, bronbestand, rubrieken in dezelfde volgorde als de kolommen)
+# tabel -> (kolommen, bronbestand, rubrieken, join-sleutels die NIET leeg mogen zijn).
+# Lege join-sleutels (1 filler-rij per bestand) zouden cross-joinen, dus die weren we.
 _TABLES = {
-    "bst004": (["zi", "hpk"], "BST004T", ["ATKODE", "HPKODE"]),
-    "bst070": (["hpk", "gpk"], "BST070T", ["HPKODE", "GPKODE"]),
-    "bst711": (["gpk", "atc", "gpstnr"], "BST711T", ["GPKODE", "ATCODE", "GPSTNR"]),
-    "bst020": (["nmnr", "naam"], "BST020T", ["NMNR", "NMNAAM"]),
-    "bst131": (["zi"], "BST131T", ["ZINR"]),
-    "bst132": (["zi", "inid", "insrt"], "BST132T", ["ZINR", "INID", "INSRT"]),
-    "bst133": (["inid", "inkort"], "BST133T", ["INID", "INKORT"]),
+    "bst004": (["zi", "hpk"], "BST004T", ["ATKODE", "HPKODE"], ["zi", "hpk"]),
+    "bst070": (["hpk", "gpk"], "BST070T", ["HPKODE", "GPKODE"], ["hpk", "gpk"]),
+    "bst711": (["gpk", "atc", "gpstnr"], "BST711T", ["GPKODE", "ATCODE", "GPSTNR"], ["gpk"]),
+    "bst020": (["nmnr", "naam"], "BST020T", ["NMNR", "NMNAAM"], ["nmnr"]),
+    "bst131": (["zi"], "BST131T", ["ZINR"], ["zi"]),
+    "bst132": (["zi", "inid", "insrt"], "BST132T", ["ZINR", "INID", "INSRT"], ["zi", "inid"]),
+    "bst133": (["inid", "inkort"], "BST133T", ["INID", "INKORT"], ["inid"]),
 }
 
 # Ruime indexset voor een read-only DB: enkelvoudig + covering-composieten op
@@ -61,12 +62,16 @@ def _create_table(con: sqlite3.Connection, table: str, cols: list[str]) -> None:
     con.execute(f"CREATE TABLE {table} ({coldefs})")
 
 
-def _fill_table(con: sqlite3.Connection, gs: Gstandaard, table: str, cols, bestand, rubrieken) -> int:
+def _fill_table(con: sqlite3.Connection, gs: Gstandaard, table: str, cols, bestand, rubrieken, keys) -> int:
     placeholders = ", ".join("?" for _ in cols)
     sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
+    sleutel_idx = [cols.index(k) for k in keys]
     batch, total = [], 0
     for rec in gs.records(bestand):
-        batch.append(tuple(rec[r] for r in rubrieken))
+        rij = tuple(rec[r] for r in rubrieken)
+        if any(not rij[i] for i in sleutel_idx):  # lege join-sleutel -> overslaan
+            continue
+        batch.append(rij)
         if len(batch) >= _BATCH:
             con.executemany(sql, batch)
             total += len(batch)
@@ -106,9 +111,9 @@ def build(db_path: Path | str = DEFAULT_DB_PATH, data_dir: Path | str = DEFAULT_
     try:
         con.execute("PRAGMA journal_mode = OFF")
         con.execute("PRAGMA synchronous = OFF")
-        for table, (cols, bestand, rubrieken) in _TABLES.items():
+        for table, (cols, bestand, rubrieken, keys) in _TABLES.items():
             _create_table(con, table, cols)
-            n = _fill_table(con, gs, table, cols, bestand, rubrieken)
+            n = _fill_table(con, gs, table, cols, bestand, rubrieken, keys)
             print(f"  {table:10} {n:>8} records uit {bestand}")
         n = _fill_thesaurus(con, gs)
         print(f"  {'thesaurus':10} {n:>8} records uit BST902T")

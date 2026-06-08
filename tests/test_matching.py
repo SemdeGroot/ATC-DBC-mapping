@@ -19,9 +19,15 @@ def test_lexicon_treffer(matcher):
 
 
 def test_defert_zonder_engine_naar_geen(matcher):
-    v = matcher.classify("non-Hodgkinlymfoom")
+    v = matcher.classify("Multiple sclerose")  # geen lexicon-treffer, geen hemato-term
     assert v.ziektebeeld == GEEN
     assert v.methode == "geen-default"
+
+
+def test_hemato_vangnet_naar_geen(matcher):
+    # hematologische termen -> hoge-precisie 'geen', niet aan een solide tumor
+    for tekst in ("Chronische lymfatische leukemie", "non-Hodgkinlymfoom", "multipel myeloom"):
+        assert matcher.classify(tekst).ziektebeeld == GEEN
 
 
 def test_classify_many_dedupliceert(matcher):

@@ -1,4 +1,4 @@
-"""Integratietest voor de universum-assemblage (G-standaard + Kompas-cache)."""
+"""Integratietest voor de universum-assemblage (per ATC7, Kompas geunioneerd)."""
 import pytest
 
 from scripts import drugs
@@ -9,9 +9,10 @@ def universe():
     return drugs.build_universe()
 
 
-def test_universum_bevat_scope(universe):
-    assert len(universe) > 200  # ~331 in-scope ATC7
+def test_universum_per_atc7(universe):
+    assert len(universe) > 300  # ~331 in-scope ATC7
     assert all(atc.startswith(("L", "A10", "A08")) for atc in universe)
+    assert all(atc == g.atc7 for atc, g in universe.items())
 
 
 def test_trastuzumab_heeft_beide_bronnen(universe):
@@ -20,3 +21,10 @@ def test_trastuzumab_heeft_beide_bronnen(universe):
     assert g.addon, "verwacht add-on-indicaties"
     assert g.kompas_indicaties, "verwacht Kompas-indicaties"
     assert all({"inid", "inkort", "indicatie_aard"} <= set(i) for i in g.addon)
+
+
+def test_meerdere_formuleringen_geunioneerd(universe):
+    # L01DB01: gewone + liposomale doxorubicine vallen onder een ATC7-entry, beide titels bekend.
+    g = universe["L01DB01"]
+    assert len(g.titels) >= 2
+    assert any("liposom" in t.lower() for t in g.titels)

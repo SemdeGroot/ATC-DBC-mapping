@@ -1,12 +1,11 @@
-"""ATC-universum (in scope) met de indicatiebronnen per ATC7.
+"""ATC-universum (in scope), per ATC7 (de werkzame stof).
 
-Universum = de in-scope ATC7-codes (L/A10/A08) die in het Kompas voorkomen. Per ATC7:
-- stofnaam (Kompas-titel, anders G-standaard);
-- add-on-indicaties (G-standaard, autoritair): inid/inkort/insrt/indicatie_aard;
-- kompas-indicaties (bullets uit de preparaattekst).
-
-ATC7 is de gedeelde sleutel tussen beide bronnen; een stofnaam->Kompas-slug-koppeling
-is dus niet nodig.
+ATC7 is de sleutel: de DBC-toepassing gebruikt uiteindelijk de stof, niet de
+formulering. Alle Kompas-pagina's van een ATC7 worden samengevoegd (union) en de
+add-on-indicaties horen bij de ATC7. Een gevolg: verschillende formuleringen onder
+dezelfde ATC7 (bv. gewone en liposomale doxorubicine) delen indicaties - een bewuste
+limitatie, niet erg omdat de koppeling op stofniveau bedoeld is. De off-label add-on-
+indicaties worden in de output geflagd zodat ze herkenbaar blijven.
 """
 from __future__ import annotations
 
@@ -20,12 +19,13 @@ from scripts.gstandaard import GstandaardDB
 class Geneesmiddel:
     atc7: str
     stofnaam: str
+    titels: list[str] = field(default_factory=list)        # Kompas-paginatitels onder deze ATC7
     addon: list[dict] = field(default_factory=list)        # {inid, inkort, insrt, indicatie_aard}
     kompas_indicaties: list[str] = field(default_factory=list)
 
 
 def build_universe(db: GstandaardDB | None = None, preparaten=None) -> dict[str, Geneesmiddel]:
-    """Bouw {ATC7: Geneesmiddel} voor de in-scope Kompas-middelen, verrijkt met add-on."""
+    """Bouw {ATC7: Geneesmiddel} voor de in-scope middelen (Kompas geunioneerd)."""
     db = db or GstandaardDB()
     if preparaten is None:
         preparaten = kompas.load_preparaten(alleen_scope=True)
@@ -36,12 +36,15 @@ def build_universe(db: GstandaardDB | None = None, preparaten=None) -> dict[str,
             continue
         g = universe.get(p.atc)
         if g is None:
-            stof = p.titel or db.stofnaam_for_atc(p.atc) or p.atc
+            stof = db.stofnaam_for_atc(p.atc) or p.titel or p.atc
             g = Geneesmiddel(atc7=p.atc, stofnaam=stof)
             universe[p.atc] = g
         g.kompas_indicaties.extend(p.indicaties)
+        if p.titel:
+            g.titels.append(p.titel)
 
     for atc7, g in universe.items():
         g.addon = db.addon_indicaties_for_atc(atc7)
         g.kompas_indicaties = list(dict.fromkeys(g.kompas_indicaties))
+        g.titels = list(dict.fromkeys(g.titels))
     return universe
