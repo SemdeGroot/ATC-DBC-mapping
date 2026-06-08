@@ -4,7 +4,9 @@ output/
 __pycache__/
 *.pyc
 .pytest_cache/
-data/
+data/**
+!data/gstandaard.sqlite
+!data/verdicts.json
 prompts/
 context/
 
