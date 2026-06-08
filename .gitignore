@@ -3,5 +3,7 @@ cache/
 output/
 __pycache__/
 *.pyc
+data/
+prompts/
 
 CLAUDE.md
