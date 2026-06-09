@@ -8,6 +8,7 @@ data/**
 !data/gstandaard.sqlite
 !data/verdicts.json
 !data/worklist.json
+!data/ATC inclusion DMA.xlsx
 prompts/
 context/
 
