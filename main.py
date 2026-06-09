@@ -27,6 +27,7 @@ from openpyxl import Workbook
 
 from scripts import drugs
 from scripts.dbc import load_ziektebeelden
+from scripts.diff_oude_lijst import bereken_diff
 from scripts.gstandaard import DEFAULT_DB_PATH, GstandaardDB
 from scripts.matching import GEEN, OLLAMA_MODEL, Matcher, Verdict
 
@@ -173,11 +174,13 @@ def _schrijf_drug_dbc(universe, koppelingen, ziektebeelden):
     return pad
 
 
-def _schrijf_deliverable_xlsx(universe, koppelingen, ziektebeelden, slugs):
+def _schrijf_deliverable_xlsx(universe, koppelingen, ziektebeelden, slugs, diff):
     """Excel voor de apotheker: tab "Medicatie" (geel = te checken) + tab per ziektebeeld.
 
-    Een correctie in de dropdown van "Medicatie" gaat via apply_review naar de overrides
-    en hergroepeert bij een herdraai automatisch ook de ziektebeeld-tabs.
+    Per ziektebeeld-tab een diff-sectie t.o.v. de oude DMA-lijst (nieuw/verwijderd/
+    gebleven) en een samenvattingstab "Diff-overzicht" met de aantallen. Een correctie in
+    de dropdown van "Medicatie" gaat via apply_review naar de overrides en hergroepeert
+    bij een herdraai automatisch ook de ziektebeeld-tabs.
     """
     from openpyxl.styles import Font, PatternFill
     from openpyxl.worksheet.datavalidation import DataValidation
@@ -245,8 +248,41 @@ def _schrijf_deliverable_xlsx(universe, koppelingen, ziektebeelden, slugs):
                        "ja" if info["off_label"] else "", round(info["confidence"], 2), info["methode"]])
             if _te_checken(info):
                 geel(ws)
-        for col, br in {"A": 10, "B": 26, "C": 10, "D": 9, "E": 10, "F": 12}.items():
+
+        # Diff t.o.v. de oude DMA-lijst
+        d = diff.get(slug, {"nieuw": [], "verwijderd": [], "gebleven": [], "buiten_scope": []})
+        ws.append([]); ws.append(["Diff t.o.v. oude lijst"]); ws[ws.max_row][0].font = VET
+        verw_evs = sum(1 for *_, h in d["verwijderd"] if h == "EVS")
+        ws.append([f"nieuw: {len(d['nieuw'])}  |  verwijderd: {len(d['verwijderd'])} "
+                   f"(EVS: {verw_evs}, add-on: {len(d['verwijderd']) - verw_evs})  |  "
+                   f"gebleven: {len(d['gebleven'])}"])
+        ws.append(["status", "atc7", "stofnaam", "oude_herkomst"]); kleur_kop(ws, ws.max_row)
+        for status, items in (("nieuw", d["nieuw"]), ("verwijderd", d["verwijderd"]),
+                              ("gebleven", d["gebleven"])):
+            for atc7, naam, herkomst in items:
+                ws.append([status, atc7, naam, herkomst])
+        if d["buiten_scope"]:
+            ws.append([]); ws.append(["Oude EVS-codes buiten onze scope (niet vergeleken)"])
+            ws[ws.max_row][0].font = VET
+            for atc7, naam in d["buiten_scope"]:
+                ws.append(["buiten-scope", atc7, naam, "EVS"])
+        for col, br in {"A": 13, "B": 10, "C": 26, "D": 9, "E": 10, "F": 12}.items():
             ws.column_dimensions[col].width = br
+
+    # --- Tab Diff-overzicht ---
+    ws = wb.create_sheet(title="Diff-overzicht")
+    ws.append(["ziektebeeld", "nieuw", "verwijderd", "verw_EVS", "verw_addon",
+               "gebleven", "buiten_scope"])
+    kleur_kop(ws)
+    for slug in ziektebeelden:
+        d = diff.get(slug, {})
+        verw = d.get("verwijderd", [])
+        verw_evs = sum(1 for *_, h in verw if h == "EVS")
+        ws.append([slug, len(d.get("nieuw", [])), len(verw), verw_evs, len(verw) - verw_evs,
+                   len(d.get("gebleven", [])), len(d.get("buiten_scope", []))])
+    for col, br in {"A": 22, "B": 9, "C": 11, "D": 10, "E": 11, "F": 10, "G": 13}.items():
+        ws.column_dimensions[col].width = br
+    ws.freeze_panes = "A2"
 
     pad = OUTPUT_DIR / "dbc_drugs.xlsx"
     wb.save(pad)
@@ -295,9 +331,16 @@ def main():
         if not koppelingen[atc7]:
             koppelingen[atc7]["geen"] = _geen_rij(g)
 
+    nieuw_per_slug: dict[str, set] = collections.defaultdict(set)
+    for atc7, kopp in koppelingen.items():
+        for slug in kopp:
+            if slug != GEEN:
+                nieuw_per_slug[slug].add(atc7)
+    diff = bereken_diff(nieuw_per_slug, universe)
+
     OUTPUT_DIR.mkdir(exist_ok=True)
     p1 = _schrijf_drug_dbc(universe, koppelingen, ziektebeelden)
-    p2 = _schrijf_deliverable_xlsx(universe, koppelingen, ziektebeelden, list(ziektebeelden))
+    p2 = _schrijf_deliverable_xlsx(universe, koppelingen, ziektebeelden, list(ziektebeelden), diff)
 
     per_zb = collections.Counter(slug for k in koppelingen.values() for slug in k if slug != GEEN)
     te_checken = sum(1 for k in koppelingen.values() for info in k.values() if _te_checken(info))
